@@ -22,6 +22,38 @@ command (or one click).
 
 All three read/write the same `~/.csm/sessions.json`.
 
+## Prerequisites
+
+CSM is **macOS-only** — every `resume` flow drives iTerm2 via AppleScript.
+
+**Required to run the CLI and web UI:**
+
+- **macOS** (10.15 Catalina or later).
+- **iTerm2** (<https://iterm2.com>) — Terminal.app and other terminals are
+  not supported. Resume always opens / renames an iTerm2 tab.
+- **Claude Code** installed, and used at least once in any project you want
+  to bookmark (CSM picks up sessions from `~/.claude/projects/`). For the
+  resume command itself CSM picks the launcher in this order:
+  1. `superclaude` (a permission-bypassing wrapper) if on `PATH`; else
+  2. `claude --dangerously-skip-permissions`.
+- **Python 3.10+** for `csm` and `csm server`. Stdlib only — no `pip
+  install` step. macOS 13+ ships with a recent enough Python out of the box.
+
+**Required only to build the native macOS app (`mac/CSM.app`):**
+
+- **Xcode 16 or later** — `Package.swift` declares
+  `swift-tools-version: 6.0`, which ships with Xcode 16.
+- **macOS 14 (Sonoma) or later** — the SwiftUI deployment target.
+
+**Workflow note:** if you've connected Claude to an iTerm2 MCP server so
+Claude can drive your terminal, CSM works alongside that. CSM itself talks
+to iTerm via raw AppleScript and does **not** require the MCP — but the
+typical CSM user has both set up.
+
+**Not required:** environment variables, Homebrew packages at runtime,
+the `gh` / GitHub CLI, or any network access (the server binds to
+`127.0.0.1`).
+
 ## Install
 
 CLI:
@@ -44,9 +76,10 @@ cd mac
 open CSM.app
 ```
 
-Requires Xcode 15+ (Swift 6, macOS 14 deployment target). The first time you
-hit Resume, macOS will prompt for permission to control iTerm2 — that's the
-`NSAppleEventsUsageDescription` in `Info.plist`.
+See the [Prerequisites](#prerequisites) section for the toolchain requirements
+(Xcode 16+, macOS 14+). The first time you hit Resume, macOS will prompt for
+permission to control iTerm2 — that's the `NSAppleEventsUsageDescription` in
+`Info.plist`.
 
 ## CLI
 
