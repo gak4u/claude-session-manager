@@ -1,0 +1,6 @@
+.build/
+.swiftpm/
+CSM.app/
+csm.app/
+*.xcodeproj/
+DerivedData/

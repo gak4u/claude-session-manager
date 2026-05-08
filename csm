@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""csm — Claude Session Manager."""
+
+import argparse
+import http.server
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+DB_PATH = Path.home() / ".csm" / "sessions.json"
+CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 7337
+DB_LOCK = threading.Lock()
+
+
+class CsmError(Exception):
+    pass
+
+
+# ---------- storage ----------
+
+def load_db() -> dict:
+    if not DB_PATH.exists():
+        return {"sessions": {}}
+    with DB_PATH.open() as f:
+        return json.load(f)
+
+
+def save_db(db: dict) -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = DB_PATH.with_suffix(".json.tmp")
+    with tmp.open("w") as f:
+        json.dump(db, f, indent=2)
+    tmp.replace(DB_PATH)
+
+
+# ---------- session detection ----------
+
+def project_dir_for(cwd: Path) -> Path:
+    flat = "-" + str(cwd).lstrip("/").replace("/", "-")
+    return CLAUDE_PROJECTS / flat
+
+
+def current_session_id(cwd: Path) -> str:
+    pdir = project_dir_for(cwd)
+    if not pdir.is_dir():
+        raise CsmError(
+            f"no Claude project dir at {pdir} "
+            f"(have you run `claude` in {cwd} yet?)"
+        )
+    sessions = sorted(
+        pdir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    if not sessions:
+        raise CsmError(f"no .jsonl sessions found in {pdir}")
+    return sessions[0].stem
+
+
+def _read_cwd_from_jsonl(path: Path) -> str | None:
+    try:
+        with path.open() as f:
+            for i, line in enumerate(f):
+                if i > 30:
+                    break
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(d, dict) and isinstance(d.get("cwd"), str):
+                    return d["cwd"]
+    except OSError:
+        return None
+    return None
+
+
+ACTIVE_WINDOW_SECONDS = 28800  # 8 hours — catches sessions you've used today
+
+
+def discover_active(window_seconds: int = ACTIVE_WINDOW_SECONDS) -> list[dict]:
+    if not CLAUDE_PROJECTS.is_dir():
+        return []
+    cutoff = datetime.now().timestamp() - window_seconds
+    out = []
+    for jsonl in CLAUDE_PROJECTS.glob("*/*.jsonl"):
+        try:
+            mtime = jsonl.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < cutoff:
+            continue
+        cwd = _read_cwd_from_jsonl(jsonl)
+        if not cwd:
+            continue
+        out.append(
+            {
+                "session_id": jsonl.stem,
+                "project_path": cwd,
+                "last_active": datetime.fromtimestamp(mtime, timezone.utc)
+                .astimezone()
+                .isoformat(timespec="seconds"),
+            }
+        )
+    out.sort(key=lambda e: e["last_active"], reverse=True)
+    return out
+
+
+# ---------- helpers ----------
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def relative_time(iso: str) -> str:
+    then = datetime.fromisoformat(iso)
+    now = datetime.now(then.tzinfo) if then.tzinfo else datetime.now()
+    s = int((now - then).total_seconds())
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
+def short_path(p: str) -> str:
+    home = str(Path.home())
+    return "~" + p[len(home):] if p.startswith(home) else p
+
+
+def applescript_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def rename_iterm_tab(name: str) -> None:
+    safe = applescript_escape(name)
+    script = (
+        f'tell application "iTerm2" to tell current session '
+        f'of current tab of current window to set name to "{safe}"'
+    )
+    subprocess.run(["osascript", "-e", script], check=False, capture_output=True)
+
+
+def resolve_resume_argv(session_id: str) -> list[str]:
+    """Pick `superclaude --resume <id>` if available, else fall back to
+    `claude --dangerously-skip-permissions --resume <id>`."""
+    if shutil.which("superclaude"):
+        return ["superclaude", "--resume", session_id]
+    if shutil.which("claude"):
+        return ["claude", "--dangerously-skip-permissions", "--resume", session_id]
+    raise CsmError("neither 'superclaude' nor 'claude' was found on PATH")
+
+
+def spawn_iterm_tab(name: str, project_path: str, session_id: str) -> None:
+    # Detection runs inside the spawned tab's shell so it picks up the user's
+    # interactive PATH, which may differ from the server process's PATH.
+    sid = shlex.quote(session_id)
+    resume_cmd = (
+        f"if command -v superclaude >/dev/null 2>&1; then "
+        f"superclaude --resume {sid}; "
+        f"else "
+        f"claude --dangerously-skip-permissions --resume {sid}; "
+        f"fi"
+    )
+    shell_cmd = f"cd {shlex.quote(project_path)} && {resume_cmd}"
+    n = applescript_escape(name)
+    c = applescript_escape(shell_cmd)
+    script = f'''
+    tell application "iTerm2"
+        activate
+        if (count of windows) = 0 then
+            create window with default profile
+            tell current session of current window
+                set name to "{n}"
+                write text "{c}"
+            end tell
+        else
+            tell current window
+                set newTab to (create tab with default profile)
+                tell current session of newTab
+                    set name to "{n}"
+                    write text "{c}"
+                end tell
+            end tell
+        end if
+    end tell
+    '''
+    subprocess.run(
+        ["osascript", "-e", script], check=True, capture_output=True, text=True
+    )
+
+
+# ---------- CLI commands ----------
+
+def cmd_save(args):
+    db = load_db()
+    if args.name in db["sessions"] and not args.force:
+        sys.exit(f"error: '{args.name}' already exists (use --force to overwrite)")
+    cwd = Path.cwd().resolve()
+    try:
+        sid = current_session_id(cwd)
+    except CsmError as e:
+        sys.exit(f"error: {e}")
+    db["sessions"][args.name] = {
+        "session_id": sid,
+        "project_path": str(cwd),
+        "saved_at": now_iso(),
+    }
+    save_db(db)
+    print(f"saved '{args.name}' -> {sid[:8]}... in {cwd}")
+
+
+def cmd_list(args):
+    db = load_db()
+    sessions = db["sessions"]
+    if not sessions:
+        print("(no saved sessions — try `csm save <name>` inside a Claude project)")
+        return
+    rows = sorted(sessions.items(), key=lambda kv: kv[1]["saved_at"], reverse=True)
+    name_w = max(len("NAME"), max(len(n) for n, _ in rows))
+    proj_w = max(
+        len("PROJECT"), max(len(short_path(e["project_path"])) for _, e in rows)
+    )
+    print(f"{'NAME':<{name_w}}  {'PROJECT':<{proj_w}}  {'SESSION':<10}  SAVED")
+    for name, e in rows:
+        print(
+            f"{name:<{name_w}}  {short_path(e['project_path']):<{proj_w}}  "
+            f"{e['session_id'][:8]:<10}  {relative_time(e['saved_at'])}"
+        )
+
+
+def cmd_resume(args):
+    db = load_db()
+    e = db["sessions"].get(args.name)
+    if not e:
+        sys.exit(f"error: no saved session named '{args.name}'")
+    proj = Path(e["project_path"])
+    if not proj.is_dir():
+        sys.exit(f"error: project_path no longer exists: {proj}")
+    rename_iterm_tab(args.name)
+    os.chdir(proj)
+    try:
+        argv = resolve_resume_argv(e["session_id"])
+    except CsmError as err:
+        sys.exit(f"error: {err}")
+    os.execvp(argv[0], argv)
+
+
+def cmd_delete(args):
+    db = load_db()
+    if args.name not in db["sessions"]:
+        sys.exit(f"error: no saved session named '{args.name}'")
+    if not args.yes:
+        ans = input(f"delete '{args.name}'? [y/N] ").strip().lower()
+        if ans not in ("y", "yes"):
+            print("aborted")
+            return
+    del db["sessions"][args.name]
+    save_db(db)
+    print(f"deleted '{args.name}'")
+
+
+def cmd_rename(args):
+    db = load_db()
+    if args.old not in db["sessions"]:
+        sys.exit(f"error: no saved session named '{args.old}'")
+    if args.new in db["sessions"]:
+        sys.exit(f"error: '{args.new}' already exists")
+    e = db["sessions"].pop(args.old)
+    e["saved_at"] = now_iso()
+    db["sessions"][args.new] = e
+    save_db(db)
+    print(f"renamed '{args.old}' -> '{args.new}'")
+
+
+# ---------- HTTP server ----------
+
+class CsmHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "csm/0.1"
+
+    def _allowed_hosts(self):
+        host, port = self.server.server_address[0], self.server.server_address[1]
+        return {f"{host}:{port}", f"localhost:{port}"}
+
+    def _check_host(self) -> bool:
+        host = self.headers.get("Host", "")
+        if host not in self._allowed_hosts():
+            self._json(403, {"error": f"invalid host header: {host}"})
+            return False
+        return True
+
+    def _json(self, status, body):
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length == 0:
+            return {}
+        return json.loads(self.rfile.read(length))
+
+    def _require_json_ct(self) -> bool:
+        ct = self.headers.get("Content-Type", "")
+        if not ct.startswith("application/json"):
+            self._json(415, {"error": "expected Content-Type: application/json"})
+            return False
+        return True
+
+    def _serve_static(self, filename, ctype):
+        path = Path(__file__).resolve().parent / filename
+        if not path.is_file():
+            self._json(404, {"error": "static file not found"})
+            return
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write(
+            f"[{datetime.now().strftime('%H:%M:%S')}] "
+            f"{self.address_string()} {fmt % args}\n"
+        )
+
+    def do_GET(self):
+        if not self._check_host():
+            return
+        path = urlparse(self.path).path
+        if path in ("/", "/index.html"):
+            self._serve_static("index.html", "text/html; charset=utf-8")
+            return
+        if path == "/api/sessions":
+            with DB_LOCK:
+                db = load_db()
+            self._json(200, db)
+            return
+        if path == "/api/active":
+            self._json(200, {"active": discover_active()})
+            return
+        self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if not self._check_host():
+            return
+        if not self._require_json_ct():
+            return
+        path = urlparse(self.path).path
+        try:
+            body = self._read_json()
+        except json.JSONDecodeError:
+            self._json(400, {"error": "invalid JSON"})
+            return
+        if path == "/api/sessions/save":
+            self._handle_save(body)
+        elif path == "/api/sessions/resume":
+            self._handle_resume(body)
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        if not self._check_host():
+            return
+        path = urlparse(self.path).path
+        m = re.match(r"^/api/sessions/([^/]+)$", path)
+        if not m:
+            self._json(404, {"error": "not found"})
+            return
+        name = unquote(m.group(1))
+        with DB_LOCK:
+            db = load_db()
+            if name not in db["sessions"]:
+                self._json(404, {"error": f"no session '{name}'"})
+                return
+            del db["sessions"][name]
+            save_db(db)
+        self._json(200, {"deleted": name})
+
+    def do_PATCH(self):
+        if not self._check_host():
+            return
+        if not self._require_json_ct():
+            return
+        path = urlparse(self.path).path
+        m = re.match(r"^/api/sessions/([^/]+)/rename$", path)
+        if not m:
+            self._json(404, {"error": "not found"})
+            return
+        name = unquote(m.group(1))
+        try:
+            body = self._read_json()
+        except json.JSONDecodeError:
+            self._json(400, {"error": "invalid JSON"})
+            return
+        new_name = (body.get("new_name") or "").strip()
+        if not new_name:
+            self._json(400, {"error": "missing new_name"})
+            return
+        with DB_LOCK:
+            db = load_db()
+            if name not in db["sessions"]:
+                self._json(404, {"error": f"no session '{name}'"})
+                return
+            if new_name in db["sessions"]:
+                self._json(409, {"error": f"'{new_name}' already exists"})
+                return
+            entry = db["sessions"].pop(name)
+            entry["saved_at"] = now_iso()
+            db["sessions"][new_name] = entry
+            save_db(db)
+        self._json(200, {"renamed": {"from": name, "to": new_name}})
+
+    def _handle_save(self, body):
+        name = (body.get("name") or "").strip()
+        path_str = (body.get("path") or "").strip()
+        if not name:
+            self._json(400, {"error": "missing name"})
+            return
+        if not path_str:
+            self._json(400, {"error": "missing path"})
+            return
+        cwd = Path(path_str).expanduser().resolve()
+        if not cwd.is_dir():
+            self._json(400, {"error": f"not a directory: {cwd}"})
+            return
+        try:
+            sid = current_session_id(cwd)
+        except CsmError as e:
+            self._json(400, {"error": str(e)})
+            return
+        with DB_LOCK:
+            db = load_db()
+            db["sessions"][name] = {
+                "session_id": sid,
+                "project_path": str(cwd),
+                "saved_at": now_iso(),
+            }
+            save_db(db)
+        self._json(
+            200, {"saved": name, "session_id": sid, "project_path": str(cwd)}
+        )
+
+    def _handle_resume(self, body):
+        name = (body.get("name") or "").strip()
+        if not name:
+            self._json(400, {"error": "missing name"})
+            return
+        with DB_LOCK:
+            db = load_db()
+            entry = db["sessions"].get(name)
+        if not entry:
+            self._json(404, {"error": f"no session '{name}'"})
+            return
+        proj = Path(entry["project_path"])
+        if not proj.is_dir():
+            self._json(400, {"error": f"project_path no longer exists: {proj}"})
+            return
+        try:
+            spawn_iterm_tab(name, str(proj), entry["session_id"])
+        except subprocess.CalledProcessError as e:
+            stderr = (
+                e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
+            )
+            self._json(500, {"error": f"osascript failed: {stderr.strip()}"})
+            return
+        self._json(200, {"resumed": name})
+
+
+def cmd_server(args):
+    server = http.server.ThreadingHTTPServer((args.host, args.port), CsmHandler)
+    print(f"csm server listening on http://{args.host}:{args.port}")
+    print("(Ctrl-C to stop)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nshutting down")
+    finally:
+        server.server_close()
+
+
+# ---------- main ----------
+
+def main():
+    p = argparse.ArgumentParser(prog="csm", description="Claude Session Manager")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("save", help="save the current Claude session under a name")
+    s.add_argument("name")
+    s.add_argument("--force", action="store_true", help="overwrite if name exists")
+    s.set_defaults(func=cmd_save)
+
+    s = sub.add_parser("list", help="list saved sessions")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("resume", help="cd into project and resume the saved session")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_resume)
+
+    s = sub.add_parser("delete", help="delete a saved session entry")
+    s.add_argument("name")
+    s.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
+    s.set_defaults(func=cmd_delete)
+
+    s = sub.add_parser("rename", help="rename a saved session entry")
+    s.add_argument("old")
+    s.add_argument("new")
+    s.set_defaults(func=cmd_rename)
+
+    s = sub.add_parser("server", help="run the web UI on localhost")
+    s.add_argument("--host", default=DEFAULT_HOST)
+    s.add_argument("--port", type=int, default=DEFAULT_PORT)
+    s.set_defaults(func=cmd_server)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

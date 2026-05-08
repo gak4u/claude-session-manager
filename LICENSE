@@ -1,0 +1,35 @@
+CSM — Claude Session Manager
+
+Copyright (c) 2026 The CSM Authors.
+
+Personal Use License
+
+Permission is hereby granted, free of charge, to any individual obtaining a
+copy of this software and associated documentation files (the "Software"), to
+use, copy, modify, and distribute the Software for personal, non-commercial
+purposes, subject to the following conditions:
+
+1. The above copyright notice and this license shall be included in all
+   copies or substantial portions of the Software.
+
+2. Commercial use requires a separate license. If you wish to use this
+   Software, in whole or in part, for any commercial purpose — including but
+   not limited to use within a for-profit organization, distribution as part
+   of a paid product or service, internal tooling at a commercial entity, or
+   any other use intended to generate revenue — you must obtain prior written
+   permission. To request a commercial license, please open an issue on the
+   project's GitHub repository:
+
+       https://github.com/gak4u/claude-session-manager/issues
+
+3. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+   THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE.
+
+Note: This license is source-available, not OSI-approved "open source" in the
+strict sense (which requires unrestricted commercial use). For commercial
+licensing inquiries, please open an issue at the URL above.
