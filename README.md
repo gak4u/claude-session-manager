@@ -68,7 +68,24 @@ Requires Python 3 (stdlib only). For the resume command, CSM uses
 `claude --dangerously-skip-permissions`. So you need at least one of those
 installed.
 
-Native app:
+Native app — **pre-built download (recommended for end users):**
+
+Grab the latest `CSM.app.zip` from the
+[Releases page](https://github.com/gak4u/claude-session-manager/releases/latest):
+
+```sh
+gh release download --repo gak4u/claude-session-manager --pattern 'CSM.app.zip'
+unzip CSM.app.zip
+xattr -dr com.apple.quarantine CSM.app   # only if Gatekeeper blocks first launch
+open CSM.app
+```
+
+The app is ad-hoc signed (not notarized). On first launch macOS may show
+"can't be opened because Apple cannot check it for malicious software" — use
+the `xattr` line above, or right-click `CSM.app` → **Open** → **Open** for a
+one-time approval.
+
+Native app — **build from source:**
 
 ```sh
 cd mac
@@ -80,6 +97,9 @@ See the [Prerequisites](#prerequisites) section for the toolchain requirements
 (Xcode 16+, macOS 14+). The first time you hit Resume, macOS will prompt for
 permission to control iTerm2 — that's the `NSAppleEventsUsageDescription` in
 `Info.plist`.
+
+For more detail on building, running, and contributing, see
+[AGENTS.md](AGENTS.md).
 
 ## CLI
 
